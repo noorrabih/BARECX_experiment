@@ -18,6 +18,7 @@ Output
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import os
@@ -73,15 +74,20 @@ def get_codes_for_id(sentence_id, df_ann: pd.DataFrame) -> list[str]:
     return codes
 
 
-# ── Select one shot per level from a pool ──────────────────────────────────────
-def select_shots(pool_df: pd.DataFrame, df_ann: pd.DataFrame, df_codes: pd.DataFrame) -> list[dict]:
+# ── Select up to n shots per level from a pool ─────────────────────────────────
+def select_shots(
+    pool_df: pd.DataFrame,
+    df_ann: pd.DataFrame,
+    df_codes: pd.DataFrame,
+    n_shots: int = 1,
+) -> dict[int, list[dict]]:
     """
-    From pool_df (already filtered to training rows), pick one sentence per
-    Readability_Level_19.  Prefers sentences that have annotated codes.
-    Returns a list of dicts: {sentence, level, codes, features}.
+    From pool_df (training rows), pick up to n_shots sentences per
+    Readability_Level_19, preferring sentences that have annotated codes.
+    Returns {level: [shot, ...]}.
     """
     train_pool = pool_df[pool_df["split"] == "train"]
-    shots: list[dict] = []
+    shots_by_level: dict[int, list[dict]] = {}
     for level, group in train_pool.groupby("Readability_Level_19"):
         level = int(level)
         features = (
@@ -89,18 +95,17 @@ def select_shots(pool_df: pd.DataFrame, df_ann: pd.DataFrame, df_codes: pd.DataF
                 ["code", "description"]
             ].to_dict(orient="records")
         )
-        chosen = None
+        chosen: list[dict] = []
         for _, row in group.iterrows():
+            if len(chosen) >= n_shots:
+                break
             codes = get_codes_for_id(row["ID"], df_ann)
             if codes:
-                chosen = {"sentence": row["Sentence"], "level": level, "codes": codes, "features": features}
-                break
-        if chosen is None:
-            # No annotated codes found — still include the example with empty codes
-            row = group.iloc[0]
-            chosen = {"sentence": row["Sentence"], "level": level, "codes": [], "features": features}
-        shots.append(chosen)
-    return shots
+                chosen.append({"sentence": row["Sentence"], "level": level, "codes": codes, "features": features})
+        if len(chosen) < n_shots:
+            print(f"  WARNING: level {level} has only {len(chosen)} annotated shot(s) (requested {n_shots})")
+        shots_by_level[level] = chosen
+    return shots_by_level
 
 
 # ── Build few-shot block ────────────────────────────────────────────────────────
@@ -108,13 +113,9 @@ def build_few_shot_block(shots: list[dict]) -> str:
     separator = "\n" + "─" * 60 + "\n"
     blocks = ["Here are some annotated examples to guide you:"]
     for i, shot in enumerate(shots, 1):
-        features_block = "\n".join(
-            f'  - Code: {f["code"]} | Feature: {f["description"]}' for f in shot["features"]
-        )
         codes_str = json.dumps(shot["codes"], ensure_ascii=False)
         blocks.append(
-            f"[Example {i} — Level {shot['level']}]\n"
-            f"Available features:\n{features_block}\n"
+            f"[Example {i}]\n"
             f'Sentence: "{shot["sentence"]}"\n'
             f"Answer: {codes_str}"
         )
@@ -150,23 +151,30 @@ def build_prompt_few_shot(sentence: str, features: list[dict], few_shot_block: s
         else ""
     )
 
+    sep = "─" * 60
     return (
         f"You are an expert Arabic linguist.\n\n"
-        "You will be given a sentence and a list of linguistic features (each with a code and description).\n"
-        f"{few_shot_block}\n\n"
-        f"Now it's your turn. Below is the list of Arabic linguistic features (each with a code):\n"
-        f"{features_block}\n"
-        f"{counting_section}"
-        f'Sentence to analyse:\n"{sentence}"\n\n'
-        f"Task:\n"
-        f"Identify which of the above features are present in the sentence.\n"
+        f"You will be given a sentence and a list of linguistic features (each with a code and description).\n"
+        f"Identify which features are present in the sentence.\n"
         f"Return ONLY a valid JSON array of the matching codes, with no explanation.\n"
-        f"If none match, return an empty array: []\n"
+        f"If none match, return an empty array: []\n\n"
+        f"Available features:\n{features_block}\n"
+        f"{counting_section}\n"
+        f"{few_shot_block}\n\n"
+        f"{sep}\n"
+        f"Now it's your turn.\n"
+        f'Sentence to analyse:\n"{sentence}"\n'
     )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-shots", type=int, default=1, choices=range(1, 5),
+                        metavar="{1-4}", help="Number of same-level shots per prompt (1–4)")
+    args = parser.parse_args()
+    n_shots = args.n_shots
+
     df_iaa = pd.read_csv("iaa.csv")
     df_codes = load_codes("codes.xlsx")
     df_ann = pd.read_csv("all_annotators_reasoning_codes_RC.csv")
@@ -185,23 +193,21 @@ def main():
         print(f"  Fold {fold_name} — train: {tr}, other: {len(fold_df) - tr}")
 
     # ── Select shots: each fold uses the *other* fold's training rows ──────────
-    shots_for_a = select_shots(df_fold_b, df_ann, df_codes)   # shots come from fold B train
-    shots_for_b = select_shots(df_fold_a, df_ann, df_codes)   # shots come from fold A train
+    shots_for_a = select_shots(df_fold_b, df_ann, df_codes, n_shots)   # shots come from fold B train
+    shots_for_b = select_shots(df_fold_a, df_ann, df_codes, n_shots)   # shots come from fold A train
 
-    print(f"\nShots for Fold A: {len(shots_for_a)} examples (one per level)")
-    print(f"Shots for Fold B: {len(shots_for_b)} examples (one per level)")
-
-    few_shot_a = build_few_shot_block(shots_for_a)
-    few_shot_b = build_few_shot_block(shots_for_b)
+    print(f"\nShots for Fold A: {sum(len(v) for v in shots_for_a.values())} examples across {len(shots_for_a)} levels (up to {n_shots} per level)")
+    print(f"Shots for Fold B: {sum(len(v) for v in shots_for_b.values())} examples across {len(shots_for_b)} levels (up to {n_shots} per level)")
 
     # ── Write batch JSONL files ────────────────────────────────────────────────
-    os.makedirs("X4", exist_ok=True)
+    out_dir = f"X4/{n_shots}_shots"
+    os.makedirs(out_dir, exist_ok=True)
 
-    for fold_name, fold_df, few_shot_block in [
-        ("a", df_fold_a, few_shot_a),
-        ("b", df_fold_b, few_shot_b),
+    for fold_name, fold_df, shots_by_level in [
+        ("a", df_fold_a, shots_for_a),
+        ("b", df_fold_b, shots_for_b),
     ]:
-        out_path = f"X4/batch_fold_{fold_name}.jsonl"
+        out_path = f"{out_dir}/batch_fold_{fold_name}.jsonl"
         written = 0
         with open(out_path, "w", encoding="utf-8") as f:
             for _, row in fold_df.iterrows():
@@ -216,6 +222,8 @@ def main():
                     .to_dict(orient="records")
                 )
 
+                level_shots = shots_by_level.get(level, [])
+                few_shot_block = build_few_shot_block(level_shots)
                 prompt = build_prompt_few_shot(sentence, features, few_shot_block)
 
                 entry = {
@@ -232,23 +240,24 @@ def main():
     df_fold_b["fold"] = "B"
     df_assignments = pd.concat([df_fold_a, df_fold_b], ignore_index=True)
     df_assignments[["ID", "Sentence", "Readability_Level_19", "split", "fold"]].to_csv(
-        "X4/fold_assignments.csv", index=False
+        f"{out_dir}/fold_assignments.csv", index=False
     )
-    print(f"Saved fold assignments to X4/fold_assignments.csv")
+    print(f"Saved fold assignments to {out_dir}/fold_assignments.csv")
 
     # ── Save shots for both folds to CSV ──────────────────────────────────────
     shots_rows = []
-    for fold_name, shots in [("A", shots_for_a), ("B", shots_for_b)]:
-        for shot in shots:
-            shots_rows.append({
-                "used_as_shots_for_fold": fold_name,
-                "sourced_from_fold": "B" if fold_name == "A" else "A",
-                "level": shot["level"],
-                "sentence": shot["sentence"],
-                "codes": json.dumps(shot["codes"], ensure_ascii=False),
-            })
-    pd.DataFrame(shots_rows).to_csv("X4/shots.csv", index=False)
-    print(f"Saved shots to X4/shots.csv")
+    for fold_name, shots_by_level in [("A", shots_for_a), ("B", shots_for_b)]:
+        for level_shots in shots_by_level.values():
+            for shot in level_shots:
+                shots_rows.append({
+                    "used_as_shots_for_fold": fold_name,
+                    "sourced_from_fold": "B" if fold_name == "A" else "A",
+                    "level": shot["level"],
+                    "sentence": shot["sentence"],
+                    "codes": json.dumps(shot["codes"], ensure_ascii=False),
+                })
+    pd.DataFrame(shots_rows).to_csv(f"{out_dir}/shots.csv", index=False)
+    print(f"Saved shots to {out_dir}/shots.csv")
 
 
 if __name__ == "__main__":
